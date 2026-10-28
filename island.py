@@ -20,7 +20,7 @@ from urllib.parse import urlencode, quote
 from PySide6.QtCore import (Qt, QTimer, QPropertyAnimation, QEasingCurve, QRect, QRectF,
                             QPointF, QPoint, QSize, QLineF, QMimeData, QUrl, QTime, QObject, Signal,
                             QVariantAnimation, QAbstractNativeEventFilter, QEvent, QFileInfo,
-                            QBuffer, QIODevice)
+                            QBuffer, QIODevice, QLockFile)
 from PySide6.QtGui import (QPainter, QColor, QDesktopServices, QPixmap, QPen, QFont,
                            QPainterPath, QPolygonF, QLinearGradient, QImage, QIcon, QCursor)
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -1542,8 +1542,12 @@ class UpdateWorker(QObject):
                         break
                     f.write(chunk)
             self.installing.emit({"status": "started"})
-            # установщик сам закроет остров и запустит новую версию
-            subprocess.Popen([path, "/SILENT", "/NORESTART"])
+            # установщик сам запустит новую версию; отвязываем его от нашего процесса
+            flags = 0
+            if sys.platform == "win32":
+                flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            subprocess.Popen([path, "/SILENT", "/NORESTART"], creationflags=flags,
+                             close_fds=True)
         except Exception as ex:
             log(f"update install: {ex}", once=True)
             self.installing.emit({"status": "error"})
@@ -3037,6 +3041,8 @@ class Island(QWidget):
             self.set_update_status("скачиваю обновление…")
         elif st == "started":
             self.set_update_status("запускаю установщик…")
+            # закрываем остров сами, чтобы не висел старый экземпляр рядом с новым
+            QTimer.singleShot(600, QApplication.quit)
         else:
             self.btn_update.setEnabled(True)
             self.btn_update.setText("Повторить")
@@ -4084,6 +4090,11 @@ class Island(QWidget):
 
 def main():
     app = QApplication(sys.argv)
+    # один экземпляр: после обновления старый может ещё закрываться, поэтому ждём до 8 с
+    app.lock = QLockFile(os.path.join(tempfile.gettempdir(), "MiniIsland.lock"))
+    if not app.lock.tryLock(8000):
+        log("another instance is running, exit", once=True)
+        sys.exit(0)
     w = Island()
     w.show()
     if sys.platform == "win32":  # Alt+Space -> командная строка
