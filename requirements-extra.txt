@@ -1,0 +1,8 @@
+winrt-Windows.Graphics.Imaging
+winrt-Windows.Media.Ocr
+winrt-Windows.Globalization
+opencv-python-headless
+numpy
+mss
+pycaw
+comtypes
