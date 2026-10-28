@@ -73,7 +73,7 @@
  [],
  False,
  False,
- 1793223307,
+ 1793226559,
  [('runw.exe',
    'C:\\Users\\brutt\\Downloads\\mini-island\\.venv\\Lib\\site-packages\\PyInstaller\\bootloader\\Windows-64bit-intel\\runw.exe',
    'EXECUTABLE')],

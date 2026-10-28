@@ -177,7 +177,7 @@ def set_cfg(**kw):
     save_config(cfg)
 
 
-APP_NAME, APP_VERSION = "MiniIsland", "1.0.1"
+APP_NAME, APP_VERSION = "MiniIsland", "1.0.2"
 LOG_FILE = os.path.join(HOME, ".island_log.txt")
 _logged = set()
 
@@ -849,7 +849,7 @@ class AlbumArt(QWidget):
 
 
 class IconButton(QPushButton):
-    
+    """Кнопка плеера: prev / play / pause / next, нарисована вручную."""
 
     def __init__(self, kind, size=44):
         super().__init__()
@@ -986,7 +986,7 @@ class PlayerCard(QWidget):
 
 # ======================= экран: выделение области и пипетка =======================
 class ScreenOverlay(QWidget):
-    
+    """Полноэкранный оверлей. mode='region' -> QImage, mode='pick' -> QColor, отмена -> None."""
     done = Signal(object)
 
     def __init__(self, pix, mode):
@@ -1137,7 +1137,7 @@ class OcrWorker(QObject):
 
 
 class Recorder:
-    
+    """Запись экрана в MP4 (mss + OpenCV), в отдельном потоке."""
 
     def __init__(self):
         self.thread = None
@@ -1187,7 +1187,7 @@ class Recorder:
 
 
 class Volume:
-    
+    """Системная громкость: напрямую через Core Audio, запасной вариант pycaw."""
 
     def __init__(self, core=None):
         self.core, self.ep, self._err = core, None, ""
@@ -1259,7 +1259,7 @@ class Volume:
 
 
 class HotkeyFilter(QAbstractNativeEventFilter):
-    
+    """Глобальная горячая клавиша Alt+Space (только Windows)."""
 
     def __init__(self, callback):
         super().__init__()
@@ -1621,7 +1621,7 @@ class WinShell:
 
 
 class CoreAudio:
-
+    """Громкость и уровень звука напрямую через Windows Core Audio (ctypes, без pycaw)."""
     CLSID_ENUM = "BCDE0395-E52F-467C-8E3D-C4579291692E"
     IID_ENUM = "A95664D2-9614-4F35-A746-DE8DB63617E6"
     IID_VOL = "5CDF2C82-841E-4546-9722-0CF74078229A"
@@ -1751,7 +1751,7 @@ class CoreAudio:
 
 
 class AudioMeter:
-    
+    """Реальный уровень звука системы. Если недоступен, возвращает None."""
 
     def __init__(self, core=None):
         self.core, self.meter = core, None
@@ -2142,7 +2142,7 @@ class Resident(QWidget):
 
 
 class ThemeSwatch(QWidget):
-    
+    """Миниатюра темы: фон, пара строк и эквалайзер в стиле этой темы."""
 
     def __init__(self, key, w=72, h=42):
         super().__init__()
@@ -2180,7 +2180,7 @@ class ThemeSwatch(QWidget):
 
 
 class PickButton(QPushButton):
-    
+    """Кнопка-список: превью, название и стрелка. Сам список открывает остров."""
 
     def __init__(self, preview):
         super().__init__()
@@ -2924,6 +2924,12 @@ class Island(QWidget):
             pop.opened.connect(self._popup_opened)
             pop.closed.connect(self._popup_closed)
         v.addStretch(1)
+        ver = self.sub_label(f"Mini-Island · версия {APP_VERSION}", 11)
+        ver.setAlignment(Qt.AlignCenter)
+        fx = QGraphicsOpacityEffect(ver)
+        fx.setOpacity(0.45)   # полупрозрачная подпись внизу
+        ver.setGraphicsEffect(fx)
+        v.addWidget(ver)
         return page
 
     def open_popup(self, popup, btn):
