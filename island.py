@@ -177,7 +177,7 @@ def set_cfg(**kw):
     save_config(cfg)
 
 
-APP_NAME, APP_VERSION = "MiniIsland", "1.0.2"
+APP_NAME, APP_VERSION = "MiniIsland", "1.0.3"
 LOG_FILE = os.path.join(HOME, ".island_log.txt")
 _logged = set()
 
