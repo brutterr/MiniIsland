@@ -179,7 +179,7 @@ def set_cfg(**kw):
     save_config(cfg)
 
 
-APP_NAME, APP_VERSION = "MiniIsland", "1.0.4"
+APP_NAME, APP_VERSION = "MiniIsland", "1.0.5"
 UPDATE_URL = "https://api.github.com/repos/brutterr/MiniIsland/releases/latest"
 RELEASES_PAGE = "https://github.com/brutterr/MiniIsland/releases/latest"
 LOG_FILE = os.path.join(HOME, ".island_log.txt")
