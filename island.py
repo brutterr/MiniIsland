@@ -6,7 +6,9 @@ import operator as op
 import os
 import random
 import re
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -177,7 +179,9 @@ def set_cfg(**kw):
     save_config(cfg)
 
 
-APP_NAME, APP_VERSION = "MiniIsland", "1.0.3"
+APP_NAME, APP_VERSION = "MiniIsland", "1.0.4"
+UPDATE_URL = "https://api.github.com/repos/brutterr/MiniIsland/releases/latest"
+RELEASES_PAGE = "https://github.com/brutterr/MiniIsland/releases/latest"
 LOG_FILE = os.path.join(HOME, ".island_log.txt")
 _logged = set()
 
@@ -1491,6 +1495,60 @@ class WeatherWorker(QObject):
             self.updated.emit({"error": "Нет связи. Введи город вручную или проверь интернет"})
 
 
+# ======================= проверка обновлений (GitHub Releases) =======================
+def parse_version(text):
+    """'v1.0.4' -> (1, 0, 4); нечисловые хвосты игнорируются."""
+    nums = re.findall(r"\d+", str(text).split("-")[0])
+    return tuple(int(n) for n in nums[:4]) or (0,)
+
+
+class UpdateWorker(QObject):
+    checked = Signal(object)     # {"status": "new"|"latest"|"error", ...}
+    installing = Signal(object)  # {"status": "downloading"|"started"|"error", ...}
+
+    def check(self):
+        threading.Thread(target=self._check, daemon=True).start()
+
+    def _check(self):
+        try:
+            req = urllib.request.Request(UPDATE_URL, headers={
+                "User-Agent": APP_NAME, "Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                info = json.load(r)
+            tag = info.get("tag_name") or info.get("name") or ""
+            if parse_version(tag) <= parse_version(APP_VERSION):
+                self.checked.emit({"status": "latest", "version": tag.lstrip("vV")})
+                return
+            url = next((a["browser_download_url"] for a in info.get("assets", [])
+                        if a.get("name", "").lower().endswith(".exe")), "")
+            self.checked.emit({"status": "new", "version": tag.lstrip("vV"), "url": url,
+                               "page": info.get("html_url") or RELEASES_PAGE})
+        except Exception as ex:
+            log(f"update check: {ex}", once=True)
+            self.checked.emit({"status": "error"})
+
+    def install(self, url):
+        threading.Thread(target=self._install, args=(url,), daemon=True).start()
+
+    def _install(self, url):
+        try:
+            self.installing.emit({"status": "downloading"})
+            path = os.path.join(tempfile.gettempdir(), "MiniIsland-Setup.exe")
+            req = urllib.request.Request(url, headers={"User-Agent": APP_NAME})
+            with urllib.request.urlopen(req, timeout=30) as r, open(path, "wb") as f:
+                while True:
+                    chunk = r.read(256 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+            self.installing.emit({"status": "started"})
+            # установщик сам закроет остров и запустит новую версию
+            subprocess.Popen([path, "/SILENT", "/NORESTART"])
+        except Exception as ex:
+            log(f"update install: {ex}", once=True)
+            self.installing.emit({"status": "error"})
+
+
 # ======================= полка для файлов =======================
 class ShelfList(QListWidget):
     def __init__(self):
@@ -2399,6 +2457,10 @@ class Island(QWidget):
         self.foot_timer.timeout.connect(self.live_tick)
         self.foot_timer.start()
 
+        self.updater = UpdateWorker()
+        self.updater.checked.connect(self.on_update_checked)
+        self.updater.installing.connect(self.on_update_installing)
+        self.update_info = None
         self.weather = WeatherWorker()
         self.weather.updated.connect(self.on_weather)
         self.weather_timer = QTimer(self)
@@ -2917,20 +2979,68 @@ class Island(QWidget):
         self.btn_autostart.setChecked(self.autostart)
         self.btn_autostart.setText("Автозапуск: вкл" if self.autostart else "Автозапуск: выкл")
         self.btn_autostart.toggled.connect(self.set_autostart_pref)
+        self.btn_update = seg("Проверить обновления", checkable=False)
+        self.btn_update.clicked.connect(self.on_update_clicked)
         b_quit = seg("Выйти", checkable=False)
         b_quit.clicked.connect(QApplication.quit)
-        row("Приложение", [self.btn_autostart, b_quit])
+        row("Приложение", [self.btn_autostart, self.btn_update, b_quit])
         for pop in (self.theme_pop, self.pet_pop):
             pop.opened.connect(self._popup_opened)
             pop.closed.connect(self._popup_closed)
         v.addStretch(1)
-        ver = self.sub_label(f"Mini-Island · версия {APP_VERSION}", 11)
-        ver.setAlignment(Qt.AlignCenter)
-        fx = QGraphicsOpacityEffect(ver)
+        self.ver_label = self.sub_label(f"Mini-Island · версия {APP_VERSION}", 11)
+        self.ver_label.setAlignment(Qt.AlignCenter)
+        fx = QGraphicsOpacityEffect(self.ver_label)
         fx.setOpacity(0.45)   # полупрозрачная подпись внизу
-        ver.setGraphicsEffect(fx)
-        v.addWidget(ver)
+        self.ver_label.setGraphicsEffect(fx)
+        v.addWidget(self.ver_label)
         return page
+
+    # ---------- обновления ----------
+    def set_update_status(self, text):
+        self.ver_label.setText(f"Mini-Island · версия {APP_VERSION} · {text}" if text
+                               else f"Mini-Island · версия {APP_VERSION}")
+
+    def on_update_clicked(self):
+        info = self.update_info
+        if info and info.get("status") == "new":
+            if info.get("url"):
+                self.btn_update.setEnabled(False)
+                self.updater.install(info["url"])
+            else:   # в релизе нет установщика: открываем страницу релиза
+                QDesktopServices.openUrl(QUrl(info.get("page") or RELEASES_PAGE))
+            return
+        self.btn_update.setEnabled(False)
+        self.btn_update.setText("Проверяю…")
+        self.set_update_status("проверка обновлений…")
+        self.updater.check()
+
+    def on_update_checked(self, info):
+        self.update_info = info
+        self.btn_update.setEnabled(True)
+        st = info.get("status")
+        if st == "new":
+            self.btn_update.setText(f"Обновить до {info['version']}")
+            self.set_update_status(f"доступна версия {info['version']}")
+            self.flash(f"Доступно обновление {info['version']}")
+        elif st == "latest":
+            self.btn_update.setText("Проверить обновления")
+            self.set_update_status("установлена последняя версия")
+        else:
+            self.btn_update.setText("Проверить обновления")
+            self.set_update_status("не удалось проверить, нет связи")
+
+    def on_update_installing(self, info):
+        st = info.get("status")
+        if st == "downloading":
+            self.btn_update.setText("Скачиваю…")
+            self.set_update_status("скачиваю обновление…")
+        elif st == "started":
+            self.set_update_status("запускаю установщик…")
+        else:
+            self.btn_update.setEnabled(True)
+            self.btn_update.setText("Повторить")
+            self.set_update_status("не удалось скачать обновление")
 
     def open_popup(self, popup, btn):
         if time.time() - popup.closed_at < 0.25:  # клик, закрывший список, не должен открыть его снова
