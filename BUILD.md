@@ -22,3 +22,16 @@ def check_update():
         log(f"update: {ex}", once=True)
 ```
 
+
+---
+
+## Сборка установщика
+
+1. `build_exe.bat` собирает `dist\MiniIsland\MiniIsland.exe` (иконка `MiniIsland.ico`).
+2. Открыть `installer.iss` в Inno Setup 6.1+ и нажать Compile, на выходе
+   `installer_out\MiniIsland-Setup-<версия>.exe`.
+3. Версия задаётся в двух местах: `APP_VERSION` в `island.py` и `#define AppVersion`
+   в `installer.iss`. Они должны совпадать, иначе проверка обновлений будет путаться.
+4. Графика установщика и иконка создаются скриптом `python installer_assets/make_art.py`
+   (нужен Pillow); готовые файлы уже лежат в `installer_assets\`.
+5. Для автообновления: создать релиз на GitHub с тегом `v<версия>` и приложить `.exe` установщика.

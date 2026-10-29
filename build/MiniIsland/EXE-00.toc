@@ -69,7 +69,7 @@
  [],
  False,
  False,
- 1793230934,
+ 1793232391,
  [('runw.exe',
    'D:\\Proga\\MiniIsland\\.venv\\Lib\\site-packages\\PyInstaller\\bootloader\\Windows-64bit-intel\\runw.exe',
    'EXECUTABLE')],

@@ -8,7 +8,7 @@ if not exist ".venv\Scripts\python.exe" (
   exit /b 1
 )
 ".venv\Scripts\python.exe" -m pip install pyinstaller || goto :err
-".venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean --windowed --name MiniIsland ^
+".venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean --windowed --name MiniIsland --icon MiniIsland.ico ^
   --collect-all comtypes --collect-all pycaw ^
   --collect-all winrt.runtime --collect-all winrt.windows.foundation ^
   --collect-all winrt.windows.foundation.collections --collect-all winrt.windows.storage.streams ^

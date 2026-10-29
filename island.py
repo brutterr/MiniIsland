@@ -22,24 +22,36 @@ from PySide6.QtCore import (Qt, QTimer, QPropertyAnimation, QEasingCurve, QRect,
                             QVariantAnimation, QAbstractNativeEventFilter, QEvent, QFileInfo,
                             QBuffer, QIODevice, QLockFile)
 from PySide6.QtGui import (QPainter, QColor, QDesktopServices, QPixmap, QPen, QFont,
+                           QFontMetrics,
                            QPainterPath, QPolygonF, QLinearGradient, QImage, QIcon, QCursor)
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                                QListWidget, QListWidgetItem, QPlainTextEdit, QLabel, QSpinBox,
                                QPushButton, QMenu, QLayout, QStackedWidget, QButtonGroup,
                                QLineEdit, QSizePolicy, QGraphicsOpacityEffect, QSlider,
-                               QFileDialog, QFileIconProvider, QStyle)
+                               QFileDialog, QFileIconProvider, QStyle, QStyledItemDelegate)
 
 COLLAPSED_H = 36
 EXPANDED = (680, 432)
 WAVE_PAD = 14        # запас снизу окна: сюда выгибается нижний край острова под музыку
 IDLE_SLEEP = 45      # через сколько секунд бездействия жильцы засыпают
 MARGIN_COLLAPSED = (14, 5, 14, 5 + WAVE_PAD)
+TOAST_H = 76                                  # высота острова, когда он показывает новый трек
+TOAST_MARGINS = (14, 10, 18, 10 + WAVE_PAD)
+TOAST_SECS = 4.0                              # сколько держится показ трека
+MUSIC_PILL_W = 170                            # компактная пилюля с музыкой: обложка, время и питомец
 MARGIN_EXPANDED = (18, 14, 18, 14 + WAVE_PAD)
 EDGE_PX = 1          # самый верх экрана: здесь шторка открывается полностью
 PEEK_PX = 14         # полоса у верхнего края: здесь сначала выглядывает пилюля со временем
 PEEK_DELAY = 0.12    # сколько секунд держать курсор в полосе до появления пилюли
 EDGE_HALF = 220      # полуширина зон от центра экрана
 IMG_ROLE = Qt.UserRole + 1
+KIND_ROLE = Qt.UserRole + 2
+TIME_ROLE = Qt.UserRole + 3
+TITLE_ROLE = Qt.UserRole + 4
+SUB_ROLE = Qt.UserRole + 5
+THUMB_ROLE = Qt.UserRole + 6
+FIND_ROLE = Qt.UserRole + 7
+COPIED_ROLE = Qt.UserRole + 8
 TOP_MARGIN = 8
 HOME = os.path.expanduser("~")
 NOTE_FILE = os.path.join(HOME, ".island_note.txt")
@@ -179,7 +191,7 @@ def set_cfg(**kw):
     save_config(cfg)
 
 
-APP_NAME, APP_VERSION = "MiniIsland", "1.0.5"
+APP_NAME, APP_VERSION = "MiniIsland", "1.0.9"
 UPDATE_URL = "https://api.github.com/repos/brutterr/MiniIsland/releases/latest"
 RELEASES_PAGE = "https://github.com/brutterr/MiniIsland/releases/latest"
 LOG_FILE = os.path.join(HOME, ".island_log.txt")
@@ -442,6 +454,9 @@ def draw_icon(p, name, c, filled=False):
         _L(p, 5.66, 12.96, 12, 21)
         _L(p, 18.34, 12.96, 12, 21)
         _C(p, 12, 10, 2.6)
+    elif name == "search":
+        _C(p, 10.5, 10.5, 6)
+        _L(p, 15.2, 15.2, 20, 20)
     elif name == "refresh":
         p.drawArc(QRectF(4.5, 4.5, 15, 15), 40 * 16, 280 * 16)
         _P(p, [(18.5, 3), (18.5, 7.4), (14.1, 7.4)])
@@ -1495,6 +1510,675 @@ class WeatherWorker(QObject):
             self.updated.emit({"error": "Нет связи. Введи город вручную или проверь интернет"})
 
 
+# ======================= буфер обмена: карточки =======================
+def css_color(text):
+    m = re.match(r"rgba\((\d+),\s*(\d+),\s*(\d+),\s*(\d+)\)", text)
+    return QColor(int(m[1]), int(m[2]), int(m[3]), int(m[4])) if m else QColor(text)
+
+
+# вид записи: (значок, цвет, название)
+CLIP_KINDS = {"text": ("Aa", "#8e8e93", "Текст"), "link": ("\u2197", "#0a84ff", "Ссылка"),
+              "mail": ("@", "#30b0c7", "Почта"), "number": ("#", "#ff9f0a", "Число"),
+              "color": ("", "#ff375f", "Цвет"), "image": ("", "#bf5af2", "Изображение")}
+
+
+def classify_clip(text):
+    """Определяет вид текста и готовит строки для карточки: (вид, заголовок, подпись)."""
+    t = text.strip()
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    title = (lines[0] if lines else t)[:200]
+    if re.fullmatch(r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})", t):
+        return "color", t.upper(), "Цвет"
+    if re.fullmatch(r"(?:https?://|www\.)\S+", t, re.I):
+        host = re.sub(r"^(?:https?://)?(?:www\.)?", "", t, flags=re.I).split("/")[0]
+        return "link", t, f"Ссылка · {host}"
+    if re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", t):
+        return "mail", t, "Почта"
+    if len(t) >= 4 and re.fullmatch(r"[\d\s.,+\-()]+", t) and re.search(r"\d{3}", t):
+        return "number", t, "Число"
+    n = len(lines)
+    meta = f"{n} стр. · {len(t)} симв." if n > 1 else f"{len(t)} симв."
+    return "text", title, f"Текст · {meta}"
+
+
+def rel_time(ts):
+    d = time.time() - ts
+    if d < 45:
+        return "сейчас"
+    if d < 3600:
+        return f"{max(1, int(d // 60))} мин"
+    if d < 86400:
+        return f"{int(d // 3600)} ч"
+    return datetime.fromtimestamp(ts).strftime("%d.%m")
+
+
+class ClipDelegate(QStyledItemDelegate):
+    PAD = 10
+
+    def __init__(self, view):
+        super().__init__(view)
+        self.view = view
+
+    def sizeHint(self, opt, idx):
+        return QSize(max(opt.rect.width(), 10), 88 if idx.data(KIND_ROLE) == "image" else 62)
+
+    def del_rect(self, rect):
+        return QRect(rect.right() - self.PAD - 24, rect.center().y() - 12, 24, 24)
+
+    def paint(self, p, opt, idx):
+        v, C = self.view, self.view.colors
+        kind = idx.data(KIND_ROLE) or "text"
+        glyph, tint, _label = CLIP_KINDS[kind]
+        tint = QColor(tint)
+        r = QRectF(opt.rect).adjusted(0, 0, -1, 0)
+        hover = bool(opt.state & QStyle.State_MouseOver)
+        p.save()
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(C["card_hi"] if hover else C["card"])
+        p.drawRoundedRect(r, 14, 14)
+
+        # --- значок слева ---
+        pad = self.PAD
+        if kind == "image":
+            tile = QRectF(r.left() + pad, r.top() + pad, 76, r.height() - 2 * pad)
+        else:
+            tile = QRectF(r.left() + pad, r.center().y() - 21, 42, 42)
+        if kind == "image":
+            pm = idx.data(THUMB_ROLE)
+            if pm is not None:
+                path = QPainterPath()
+                path.addRoundedRect(tile, 10, 10)
+                p.setClipPath(path)
+                p.drawPixmap(tile.toRect(), pm)
+                p.setClipping(False)
+        elif kind == "color":
+            p.setBrush(QColor(idx.data(Qt.UserRole).strip()))
+            p.setPen(QPen(QColor(128, 128, 128, 90), 1))
+            p.drawRoundedRect(tile, 11, 11)
+            p.setPen(Qt.NoPen)
+        else:
+            bg = QColor(tint)
+            bg.setAlpha(46)
+            p.setBrush(bg)
+            p.drawRoundedRect(tile, 11, 11)
+            f = QFont(opt.font)
+            f.setPixelSize(16 if glyph != "Aa" else 15)
+            f.setWeight(QFont.Bold)
+            p.setFont(f)
+            p.setPen(tint)
+            p.drawText(tile, Qt.AlignCenter, glyph)
+
+        # --- две строки текста ---
+        left = tile.right() + 12
+        right = r.right() - pad - 56
+        y0 = r.center().y() - 18
+        f = QFont(opt.font)
+        f.setPixelSize(13)
+        f.setWeight(QFont.DemiBold)
+        p.setFont(f)
+        p.setPen(C["fg"])
+        title = idx.data(TITLE_ROLE) or ""
+        p.drawText(QRectF(left, y0, max(right - left, 10), 18), Qt.AlignVCenter | Qt.AlignLeft,
+                   p.fontMetrics().elidedText(title, Qt.ElideRight, int(max(right - left, 10))))
+        f2 = QFont(opt.font)
+        f2.setPixelSize(12)
+        p.setFont(f2)
+        p.setPen(C["sub"])
+        sub_w = max(r.right() - pad - left - 4, 10)
+        p.drawText(QRectF(left, y0 + 20, sub_w, 16), Qt.AlignVCenter | Qt.AlignLeft,
+                   p.fontMetrics().elidedText(idx.data(SUB_ROLE) or "", Qt.ElideRight, int(sub_w)))
+
+        # --- справа: время, а при наведении кнопка удаления ---
+        if hover:
+            dr = QRectF(self.del_rect(opt.rect))
+            over = v.mouse_pos is not None and self.del_rect(opt.rect).contains(v.mouse_pos)
+            if over:
+                p.setPen(Qt.NoPen)
+                p.setBrush(C["hover"])
+                p.drawEllipse(dr)
+            p.setPen(QPen(C["fg"] if over else C["sub"], 1.6, Qt.SolidLine, Qt.RoundCap))
+            c = dr.center()
+            p.drawLine(QPointF(c.x() - 4, c.y() - 4), QPointF(c.x() + 4, c.y() + 4))
+            p.drawLine(QPointF(c.x() - 4, c.y() + 4), QPointF(c.x() + 4, c.y() - 4))
+        else:
+            f3 = QFont(opt.font)
+            f3.setPixelSize(11)
+            p.setFont(f3)
+            p.setPen(C["sub"])
+            p.drawText(QRectF(r.right() - pad - 52, y0, 52, 18), Qt.AlignVCenter | Qt.AlignRight,
+                       rel_time(idx.data(TIME_ROLE) or time.time()))
+
+        # --- подтверждение копирования ---
+        copied = idx.data(COPIED_ROLE)
+        if copied and time.time() - copied < 1.4:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(48, 209, 88, 205))
+            p.drawRoundedRect(r, 14, 14)
+            f4 = QFont(opt.font)
+            f4.setPixelSize(14)
+            f4.setWeight(QFont.Bold)
+            p.setFont(f4)
+            p.setPen(QColor("white"))
+            p.drawText(r, Qt.AlignCenter, "\u2713  Скопировано")
+        p.restore()
+
+
+class ClipView(QListWidget):
+    removeRequested = Signal(object)
+
+    def __init__(self):
+        super().__init__()
+        self.mouse_pos = None
+        self.hint = ""
+        self.colors = {k: QColor() for k in ("card", "card_hi", "fg", "sub", "hover")}
+        self.setItemDelegate(ClipDelegate(self))
+        self.setMouseTracking(True)
+        self.setSpacing(3)
+        self.setFrameShape(QListWidget.NoFrame)
+        self.setSelectionMode(QListWidget.NoSelection)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollMode(QListWidget.ScrollPerPixel)
+        self.verticalScrollBar().setSingleStep(24)
+        self.viewport().setCursor(Qt.PointingHandCursor)
+        self.setStyleSheet(
+            "QListWidget { background: transparent; border: 0; padding: 0; }"
+            "QListWidget::item { background: transparent; padding: 0; margin: 0; }"
+            "QScrollBar:vertical { width: 6px; background: transparent; margin: 4px 0; }"
+            "QScrollBar::handle:vertical { background: rgba(128,128,128,110);"
+            " border-radius: 3px; min-height: 28px; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }")
+
+    def set_colors(self, T):
+        self.colors = {"card": css_color(T["card"]), "card_hi": css_color(T["card_hi"]),
+                       "fg": QColor(T["fg"]), "sub": QColor(T["sub"]),
+                       "hover": css_color(T["hover"])}
+        self.viewport().update()
+
+    def mouseMoveEvent(self, e):
+        self.mouse_pos = e.position().toPoint()
+        self.viewport().update()
+        super().mouseMoveEvent(e)
+
+    def leaveEvent(self, e):
+        self.mouse_pos = None
+        self.viewport().update()
+        super().leaveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        pos = e.position().toPoint()
+        it = self.itemAt(pos)
+        if (it is not None and e.button() == Qt.LeftButton
+                and self.itemDelegate().del_rect(self.visualItemRect(it)).contains(pos)):
+            self.removeRequested.emit(it)   # клик по крестику: удалить, а не копировать
+            return
+        super().mouseReleaseEvent(e)
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        if self.hint:
+            p = QPainter(self.viewport())
+            p.setRenderHint(QPainter.TextAntialiasing)
+            f = QFont(self.font())
+            f.setPixelSize(14)
+            p.setFont(f)
+            p.setPen(self.colors["sub"])
+            p.drawText(self.viewport().rect().adjusted(20, 0, -20, 0),
+                       Qt.AlignCenter | Qt.TextWordWrap, self.hint)
+
+
+# ======================= загрузки: карточки =======================
+# вид файла: (цвет, название, расширения)
+DL_KINDS = [("#bf5af2", "Изображение", "jpg jpeg png gif webp bmp svg heic ico tiff"),
+            ("#ff375f", "Видео", "mp4 mkv avi mov webm wmv flv m4v"),
+            ("#ff9f0a", "Аудио", "mp3 wav flac ogg m4a aac opus wma"),
+            ("#e0a800", "Архив", "zip rar 7z tar gz bz2 xz iso"),
+            ("#0a84ff", "Документ", "pdf doc docx txt rtf odt xls xlsx ppt pptx csv epub fb2 md"),
+            ("#27b85a", "Программа", "exe msi apk bat cmd ps1 jar dmg")]
+DL_OTHER = ("#8e8e93", "Файл")
+
+
+def dl_kind(name):
+    ext = os.path.splitext(name)[1].lstrip(".").lower()
+    for color, label, exts in DL_KINDS:
+        if ext in exts.split():
+            return color, label, ext
+    return DL_OTHER[0], DL_OTHER[1], ext
+
+
+def recent_downloads(limit=40):
+    """Последние файлы из папки загрузок: чтобы вкладка не была пустой после запуска."""
+    out = []
+    try:
+        for name in os.listdir(DL_DIR):
+            path = os.path.join(DL_DIR, name)
+            low = name.lower()
+            if (low.endswith(PARTIAL_EXT) or name.startswith((".", "~$"))
+                    or low == "desktop.ini" or not os.path.isfile(path)):
+                continue
+            try:
+                out.append({"name": name, "path": path, "size": os.path.getsize(path),
+                            "t": os.path.getmtime(path)})
+            except OSError:
+                continue
+    except OSError:
+        return []
+    out.sort(key=lambda d: d["t"], reverse=True)
+    return out[:limit]
+
+
+class DlDelegate(ClipDelegate):
+    def sizeHint(self, opt, idx):
+        return QSize(max(opt.rect.width(), 10), 66)
+
+    def del_rect(self, rect):
+        return QRect(rect.right() - self.PAD - 24, rect.center().y() - 12, 24, 24)
+
+    def dir_rect(self, rect):
+        return QRect(rect.right() - self.PAD - 24 - 28, rect.center().y() - 12, 24, 24)
+
+    def _button(self, p, rect, over, C, draw):
+        if over:
+            p.setPen(Qt.NoPen)
+            p.setBrush(C["hover"])
+            p.drawEllipse(QRectF(rect))
+        p.setPen(QPen(C["fg"] if over else C["sub"], 1.6, Qt.SolidLine, Qt.RoundCap,
+                      Qt.RoundJoin))
+        p.setBrush(Qt.NoBrush)
+        draw(QRectF(rect).center())
+
+    def paint(self, p, opt, idx):
+        v, C = self.view, self.view.colors
+        active = idx.data(KIND_ROLE) == "active"
+        tint = QColor("#0a84ff" if active else idx.data(THUMB_ROLE))
+        r = QRectF(opt.rect).adjusted(0, 0, -1, 0)
+        hover = bool(opt.state & QStyle.State_MouseOver)
+        p.save()
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(C["card_hi"] if hover else C["card"])
+        p.drawRoundedRect(r, 14, 14)
+
+        pad = self.PAD
+        tile = QRectF(r.left() + pad, r.center().y() - 21, 42, 42)
+        bg = QColor(tint)
+        bg.setAlpha(46)
+        p.setBrush(bg)
+        p.drawRoundedRect(tile, 11, 11)
+        label = "\u2193" if active else (idx.data(FIND_ROLE).split("\n")[0][:4].upper() or "\u2022")
+        f = QFont(opt.font)
+        f.setPixelSize(18 if active else (12 if len(label) > 3 else 13))
+        f.setWeight(QFont.Bold)
+        p.setFont(f)
+        p.setPen(tint)
+        p.drawText(tile, Qt.AlignCenter, label)
+
+        left = tile.right() + 12
+        right = r.right() - pad - (56 if hover else 60)
+        y0 = r.center().y() - 18
+        f = QFont(opt.font)
+        f.setPixelSize(13)
+        f.setWeight(QFont.DemiBold)
+        p.setFont(f)
+        p.setPen(C["fg"])
+        w = int(max(right - left, 10))
+        p.drawText(QRectF(left, y0, w, 18), Qt.AlignVCenter | Qt.AlignLeft,
+                   p.fontMetrics().elidedText(idx.data(TITLE_ROLE) or "", Qt.ElideMiddle, w))
+        f2 = QFont(opt.font)
+        f2.setPixelSize(12)
+        p.setFont(f2)
+        p.setPen(C["sub"])
+        sw = int(max(r.right() - pad - left - 4, 10))
+        p.drawText(QRectF(left, y0 + 20, sw, 16), Qt.AlignVCenter | Qt.AlignLeft,
+                   p.fontMetrics().elidedText(idx.data(SUB_ROLE) or "", Qt.ElideRight, sw))
+
+        if active:   # бегущая полоска: размер файла заранее неизвестен
+            track = QRectF(left, r.bottom() - 7, max(r.right() - pad - left, 10), 3)
+            tc = QColor(tint)
+            tc.setAlpha(50)
+            p.setPen(Qt.NoPen)
+            p.setBrush(tc)
+            p.drawRoundedRect(track, 1.5, 1.5)
+            seg = track.width() * 0.3
+            x = track.left() + ((time.time() * 0.9) % 1.0) * (track.width() + seg) - seg
+            clip = QPainterPath()
+            clip.addRoundedRect(track, 1.5, 1.5)
+            p.setClipPath(clip)
+            p.setBrush(tint)
+            p.drawRoundedRect(QRectF(x, track.top(), seg, track.height()), 1.5, 1.5)
+            p.setClipping(False)
+        if hover and not active:
+            mp = v.mouse_pos
+            dr, fr = self.del_rect(opt.rect), self.dir_rect(opt.rect)
+
+            def cross(c):
+                p.drawLine(QPointF(c.x() - 4, c.y() - 4), QPointF(c.x() + 4, c.y() + 4))
+                p.drawLine(QPointF(c.x() - 4, c.y() + 4), QPointF(c.x() + 4, c.y() - 4))
+
+            def folder(c):
+                body = QRectF(c.x() - 6.5, c.y() - 3.5, 13, 9.5)
+                p.drawRoundedRect(body, 2, 2)
+                p.drawLine(QPointF(c.x() - 6.5, c.y() - 3.5), QPointF(c.x() - 3, c.y() - 6))
+                p.drawLine(QPointF(c.x() - 3, c.y() - 6), QPointF(c.x() - 0.5, c.y() - 6))
+                p.drawLine(QPointF(c.x() - 0.5, c.y() - 6), QPointF(c.x() + 1, c.y() - 3.5))
+
+            self._button(p, dr, mp is not None and dr.contains(mp), C, cross)
+            self._button(p, fr, mp is not None and fr.contains(mp), C, folder)
+        else:
+            f3 = QFont(opt.font)
+            f3.setPixelSize(11)
+            p.setFont(f3)
+            p.setPen(C["sub"])
+            txt = "идёт" if active else rel_time(idx.data(TIME_ROLE) or time.time())
+            p.drawText(QRectF(r.right() - pad - 52, y0, 52, 18), Qt.AlignVCenter | Qt.AlignRight,
+                       txt)
+        p.restore()
+
+
+class DlView(ClipView):
+    revealRequested = Signal(object)
+
+    def __init__(self):
+        super().__init__()
+        self.setItemDelegate(DlDelegate(self))
+
+    def mouseReleaseEvent(self, e):
+        pos = e.position().toPoint()
+        it = self.itemAt(pos)
+        if it is not None and e.button() == Qt.LeftButton and it.data(KIND_ROLE) != "active":
+            rect = self.visualItemRect(it)
+            d = self.itemDelegate()
+            if d.del_rect(rect).contains(pos):
+                self.removeRequested.emit(it)
+                return
+            if d.dir_rect(rect).contains(pos):
+                self.revealRequested.emit(it)
+                return
+        QListWidget.mouseReleaseEvent(self, e)
+
+
+# ======================= прогресс обновления =======================
+class UpdateProgress(QWidget):
+    """Полоска с подписью; без известного размера бежит неопределённая полоска."""
+
+    def __init__(self):
+        super().__init__()
+        self.frac, self.text = 0.0, ""
+        self.fill, self.track, self.fg = QColor("#0a84ff"), QColor(128, 128, 128, 60), QColor("#888")
+        self.setFixedHeight(26)
+        self.tm = QTimer(self)
+        self.tm.setInterval(40)
+        self.tm.timeout.connect(self._tick)
+
+    def set_colors(self, T):
+        self.fill = QColor(T["accent"]) if T.get("accent") else QColor(T["fg"])
+        self.track = css_color(T["groove"])
+        self.fg = QColor(T["sub"])
+        self.update()
+
+    def set_state(self, frac, text):
+        self.frac, self.text = frac, text
+        if frac is None:
+            if not self.tm.isActive():
+                self.tm.start()
+        else:
+            self.tm.stop()
+        self.update()
+
+    def _tick(self):
+        if self.isVisible():
+            self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
+        w = self.width()
+        bar = QRectF(0, 2, w, 6)
+        p.setPen(Qt.NoPen)
+        p.setBrush(self.track)
+        p.drawRoundedRect(bar, 3, 3)
+        clip = QPainterPath()
+        clip.addRoundedRect(bar, 3, 3)
+        p.setClipPath(clip)
+        p.setBrush(self.fill)
+        if self.frac is None:
+            seg = w * 0.3
+            x = ((time.time() * 0.8) % 1.0) * (w + seg) - seg
+            p.drawRect(QRectF(x, 2, seg, 6))
+        else:
+            p.drawRect(QRectF(0, 2, w * max(0.0, min(1.0, self.frac)), 6))
+        p.setClipping(False)
+        f = QFont(self.font())
+        f.setPixelSize(12)
+        p.setFont(f)
+        p.setPen(self.fg)
+        p.drawText(QRectF(0, 10, w, 16), Qt.AlignCenter, self.text)
+
+
+# ======================= редактор интерфейса =======================
+NAV_KEYS = ["home", "clipboard", "download", "weather", "timer", "note", "shelf", "settings"]
+NAV_LABELS = ["Главная", "Буфер", "Загрузки", "Погода", "Таймер", "Заметка", "Полка",
+              "Настройки"]
+FN_ORDER = ["area", "screen", "ocr", "qr", "pick", "clean", "record", "command"]
+FN_LABELS = {"area": "Область", "screen": "Весь экран", "ocr": "Текст с экрана",
+             "qr": "QR-код", "pick": "Пипетка", "clean": "Чистый текст",
+             "record": "Запись экрана", "command": "Команда"}
+EDITOR_PAGE = 8      # номер страницы редактора в стеке (в панели вкладок её нет)
+
+
+def clean_order(order, default):
+    """Оставляет только известные ключи без повторов, недостающие дописывает в конец."""
+    out = []
+    for k in (order if isinstance(order, list) else []):
+        if k in default and k not in out:
+            out.append(k)
+    return out + [k for k in default if k not in out]
+
+
+class BoardChip(QWidget):
+    """Плитка в редакторе: тянуть = переставить, нажать = скрыть или показать."""
+
+    def __init__(self, board, key, label, icon_name, locked):
+        super().__init__(board)
+        self.board, self.key, self.label = board, key, label
+        self.icon_name, self.locked = icon_name, locked
+        self.icon = QIcon()
+        self.on = True
+        self._press, self._moved, self._hover = None, False, False
+        self._off = QPoint()
+        self._anim = None
+        self.setCursor(Qt.OpenHandCursor)
+
+    def enterEvent(self, e):
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, e):
+        self._hover = False
+        self.update()
+
+    def paintEvent(self, e):
+        C = self.board.colors
+        w, h = self.width(), self.height()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
+        p.setOpacity(1.0 if self.on else 0.45)
+        r = QRectF(0.5, 0.5, w - 1, h - 1)
+        p.setPen(Qt.NoPen)
+        p.setBrush(C["card_hi"] if (self._hover or self._moved) else C["card"])
+        p.drawRoundedRect(r, 12, 12)
+        if self._moved:
+            ring = QColor(C["fg"])
+            ring.setAlpha(130)
+            p.setPen(QPen(ring, 1.5))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(r, 12, 12)
+        p.setPen(Qt.NoPen)
+        p.setBrush(C["sub"])
+        for cx in (12, 17):               # «ручка» для перетаскивания
+            for cy in (h / 2 - 5, h / 2, h / 2 + 5):
+                p.drawEllipse(QPointF(cx, cy), 1.3, 1.3)
+        if not self.icon.isNull():
+            self.icon.paint(p, QRect(28, (h - 18) // 2, 18, 18))
+        f = QFont(self.font())
+        f.setPixelSize(13)
+        f.setWeight(QFont.DemiBold)
+        p.setFont(f)
+        p.setPen(C["fg"])
+        tw = max(w - 54 - 34, 10)
+        p.drawText(QRectF(54, 0, tw, h), Qt.AlignVCenter | Qt.AlignLeft,
+                   p.fontMetrics().elidedText(self.label, Qt.ElideRight, int(tw)))
+        if not self.locked:               # кружок: заполнен с галочкой = показано
+            c = QPointF(w - 18, h / 2)
+            if self.on:
+                p.setPen(Qt.NoPen)
+                p.setBrush(C["fg"])
+                p.drawEllipse(c, 8, 8)
+                p.setPen(QPen(C["bg"], 1.8, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+                p.drawLine(QPointF(c.x() - 3.5, c.y()), QPointF(c.x() - 1, c.y() + 2.8))
+                p.drawLine(QPointF(c.x() - 1, c.y() + 2.8), QPointF(c.x() + 3.8, c.y() - 3))
+            else:
+                p.setPen(QPen(C["sub"], 1.5))
+                p.setBrush(Qt.NoBrush)
+                p.drawEllipse(c, 7.5, 7.5)
+
+    def stop_anim(self):
+        if self._anim is not None:
+            self._anim.stop()
+
+    def glide_to(self, target):
+        if self.pos() == target:
+            return
+        self.stop_anim()
+        a = QPropertyAnimation(self, b"pos", self)
+        a.setDuration(150)
+        a.setEasingCurve(QEasingCurve.OutCubic)
+        a.setEndValue(target)
+        self._anim = a
+        a.start()
+
+    def mousePressEvent(self, e):
+        if e.button() != Qt.LeftButton:
+            return
+        self._press = e.globalPosition().toPoint()
+        self._off = e.position().toPoint()
+        self._moved = False
+
+    def mouseMoveEvent(self, e):
+        if self._press is None:
+            return
+        gp = e.globalPosition().toPoint()
+        if not self._moved:
+            if (gp - self._press).manhattanLength() < 6:
+                return
+            self._moved = True
+            self.stop_anim()
+            self.raise_()
+            self.setCursor(Qt.ClosedHandCursor)
+        pos = self.parentWidget().mapFromGlobal(gp) - self._off
+        self.move(self.board.clamp(pos, self))
+        self.board.reflow(self)
+        self.update()
+
+    def mouseReleaseEvent(self, e):
+        if self._press is None:
+            return
+        moved, self._press, self._moved = self._moved, None, False
+        self.setCursor(Qt.OpenHandCursor)
+        if moved:
+            self.board.settle(self)
+        elif (e.button() == Qt.LeftButton and not self.locked
+              and self.rect().contains(e.position().toPoint())):
+            self.on = not self.on
+            self.board.changed.emit()
+        self.update()
+
+
+class DragBoard(QWidget):
+    """Сетка плиток с перетаскиванием: остальные плитки расступаются во время движения."""
+    changed = Signal()
+    GAP = 8
+
+    def __init__(self, cols, cell):
+        super().__init__()
+        self.cols, self.cell = cols, cell
+        self.chips = []
+        self.fg_hex = "#000000"
+        self.colors = {k: QColor() for k in ("card", "card_hi", "fg", "sub", "bg")}
+
+    def slot(self, i):
+        cw, ch = self.cell
+        return QPoint((i % self.cols) * (cw + self.GAP), (i // self.cols) * (ch + self.GAP))
+
+    def set_items(self, items):
+        """items: [(ключ, подпись, имя значка, нельзя_скрыть, показан)]"""
+        for c in self.chips:
+            c.hide()
+            c.deleteLater()
+        self.chips = []
+        for key, label, icon_name, locked, on in items:
+            c = BoardChip(self, key, label, icon_name, locked)
+            c.on = on
+            c.resize(*self.cell)
+            self.chips.append(c)
+        rows = max(1, -(-len(items) // self.cols))
+        cw, ch = self.cell
+        self.setFixedSize(self.cols * cw + (self.cols - 1) * self.GAP,
+                          rows * ch + (rows - 1) * self.GAP)
+        self.refresh_icons()
+        for i, c in enumerate(self.chips):
+            c.move(self.slot(i))
+            c.show()
+
+    def order(self):
+        return [c.key for c in self.chips]
+
+    def hidden(self):
+        return [c.key for c in self.chips if not c.on]
+
+    def set_colors(self, T):
+        self.fg_hex = T["fg"]
+        bg = QColor(*T["panel"])
+        bg.setAlpha(255)
+        self.colors = {"card": css_color(T["card"]), "card_hi": css_color(T["card_hi"]),
+                       "fg": QColor(T["fg"]), "sub": QColor(T["sub"]), "bg": bg}
+        self.refresh_icons()
+
+    def refresh_icons(self):
+        for c in self.chips:
+            c.icon = make_icon(c.icon_name, self.fg_hex)
+            c.update()
+
+    def clamp(self, pos, chip):
+        x = max(0, min(pos.x(), self.width() - chip.width()))
+        y = max(0, min(pos.y(), self.height() - chip.height()))
+        return QPoint(x, y)
+
+    def reflow(self, chip):
+        cw, ch = self.cell
+        cen = chip.geometry().center()
+        rows = max(1, -(-len(self.chips) // self.cols))
+        col = max(0, min(self.cols - 1, cen.x() // (cw + self.GAP)))
+        row = max(0, min(rows - 1, cen.y() // (ch + self.GAP)))
+        idx = min(row * self.cols + col, len(self.chips) - 1)
+        cur = self.chips.index(chip)
+        if idx != cur:
+            self.chips.insert(idx, self.chips.pop(cur))
+            for i, c in enumerate(self.chips):
+                if c is not chip:
+                    c.glide_to(self.slot(i))
+
+    def settle(self, chip):
+        chip.glide_to(self.slot(self.chips.index(chip)))
+        self.changed.emit()
+
+
 # ======================= проверка обновлений (GitHub Releases) =======================
 def parse_version(text):
     """'v1.0.4' -> (1, 0, 4); нечисловые хвосты игнорируются."""
@@ -1521,27 +2205,40 @@ class UpdateWorker(QObject):
                 return
             url = next((a["browser_download_url"] for a in info.get("assets", [])
                         if a.get("name", "").lower().endswith(".exe")), "")
+            size = next((a.get("size", 0) for a in info.get("assets", [])
+                         if a.get("browser_download_url") == url), 0)
             self.checked.emit({"status": "new", "version": tag.lstrip("vV"), "url": url,
-                               "page": info.get("html_url") or RELEASES_PAGE})
+                               "size": size, "page": info.get("html_url") or RELEASES_PAGE})
         except Exception as ex:
             log(f"update check: {ex}", once=True)
             self.checked.emit({"status": "error"})
 
-    def install(self, url):
-        threading.Thread(target=self._install, args=(url,), daemon=True).start()
+    def install(self, url, size=0):
+        threading.Thread(target=self._install, args=(url, size), daemon=True).start()
 
-    def _install(self, url):
+    def _install(self, url, size=0):
         try:
-            self.installing.emit({"status": "downloading"})
+            self.installing.emit({"status": "downloading", "done": 0, "total": size})
             path = os.path.join(tempfile.gettempdir(), "MiniIsland-Setup.exe")
             req = urllib.request.Request(url, headers={"User-Agent": APP_NAME})
             with urllib.request.urlopen(req, timeout=30) as r, open(path, "wb") as f:
+                total = int(r.headers.get("Content-Length") or 0) or size
+                done, last_t, last_pct = 0, 0.0, -1
                 while True:
-                    chunk = r.read(256 * 1024)
+                    chunk = r.read(64 * 1024)
                     if not chunk:
                         break
                     f.write(chunk)
-            self.installing.emit({"status": "started"})
+                    done += len(chunk)
+                    pct = int(done * 100 / total) if total else -1
+                    now = time.time()
+                    if pct != last_pct and now - last_t > 0.08 or now - last_t > 0.5:
+                        last_pct, last_t = pct, now
+                        self.installing.emit({"status": "downloading", "done": done,
+                                              "total": total})
+            if done <= 0 or (total and done < total):
+                raise IOError(f"incomplete download: {done}/{total}")
+            self.installing.emit({"status": "started", "done": done, "total": done})
             # установщик сам запустит новую версию; отвязываем его от нашего процесса
             flags = 0
             if sys.platform == "win32":
@@ -2396,7 +3093,7 @@ class Island(QWidget):
         self.expanded = False
         self.pinned = False
         self.busy = 0
-        self.collapsed_w = 190
+        self.collapsed_w = 200
         self.bg_mix = 0.0
         self.accent = None
         self._own_clip = False
@@ -2408,7 +3105,10 @@ class Island(QWidget):
         self.pos, self.dur, self.pos_stamp = 0.0, 0.0, time.monotonic()
         self.weather_brief, self.rain_warned, self.last_weather = "", "", None
         self.weather_kind, self.weather_temp = "", ""
-        self.dl_state, self.dl_done = {}, []
+        self.dl_state, self.dl_done = {}, recent_downloads()
+        self.update_frac = None
+        self.toast_active, self.toast_w, self._toast_gen = False, 330, 0
+        self.track_key, self._toast_wait = None, False
         self.downloads_active, self.dl_speed = False, 0.0
         self.rec_start = 0.0
         self.dock_paths = cfg.get("dock") or default_dock()
@@ -2504,19 +3204,59 @@ class Island(QWidget):
         self.pill = ElideLabel()
         self.pill.setAlignment(Qt.AlignCenter)
         self.pill.setStyleSheet("font-size: 13px; font-weight: 600; color: white;")
-        self.mini_eq = Equalizer(4)
-        self.mini_eq.setFixedSize(18, 14)
-        self.mini_eq.hide()
         self.pill_wicon = WeatherIcon(20)
         self.pill_wicon.hide()
         self.resident_pill = Resident(self.res, False)
         self.residents.append(self.resident_pill)
-        pl.addWidget(self.resident_pill)
+        # слева обложка (когда играет музыка), по центру значок погоды вплотную к тексту,
+        # справа питомец: он на месте всегда, и с музыкой, и без неё
+        mid = QHBoxLayout()
+        mid.setContentsMargins(0, 0, 0, 0)
+        mid.setSpacing(5)
+        mid.addWidget(self.pill_wicon)
+        mid.addWidget(self.pill)
         pl.addWidget(self.mini_art)
-        pl.addWidget(self.pill_wicon)
-        pl.addWidget(self.pill, 1)
-        pl.addWidget(self.mini_eq)
+        pl.addStretch(1)
+        pl.addLayout(mid)
+        pl.addStretch(1)
+        pl.addWidget(self.resident_pill)
         self.root.addWidget(self.pill_box)
+
+        # --- показ нового трека: большая обложка, название и исполнитель ---
+        self.toast_box = QWidget()
+        tl = QHBoxLayout(self.toast_box)
+        tl.setContentsMargins(0, 0, 0, 0)
+        tl.setSpacing(12)
+        self.toast_art = AlbumArt(12)
+        self.toast_art.setFixedWidth(56)
+        self.toast_art.setMinimumHeight(0)
+        self.toast_art.setMaximumHeight(56)
+        self.toast_art.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        self.toast_title = ElideLabel()
+        self.toast_title.setStyleSheet("font-size: 15px; font-weight: 700; color: white;")
+        self.toast_artist = ElideLabel()
+        self.toast_artist.setStyleSheet("font-size: 12px; color: rgba(255,255,255,175);")
+        col.addStretch(1)
+        col.addWidget(self.toast_title)
+        col.addWidget(self.toast_artist)
+        col.addStretch(1)
+        self.toast_eq = Equalizer(4)
+        self.toast_eq.setFixedSize(18, 14)
+        tl.addWidget(self.toast_art)
+        tl.addLayout(col, 1)
+        tl.addWidget(self.toast_eq)
+        self.toast_fx = QGraphicsOpacityEffect(self.toast_box)
+        self.toast_fx.setOpacity(0.0)
+        self.toast_box.setGraphicsEffect(self.toast_fx)
+        self.toast_fade = QVariantAnimation(self)
+        self.toast_fade.valueChanged.connect(lambda v: self.toast_fx.setOpacity(float(v)))
+        self.toast_timer = QTimer(self)
+        self.toast_timer.setSingleShot(True)
+        self.toast_timer.timeout.connect(self.end_toast)
+        self.toast_box.hide()
+        self.root.addWidget(self.toast_box)
 
     def build_body(self):
         self.body = QWidget()
@@ -2529,10 +3269,16 @@ class Island(QWidget):
         navrow.setSpacing(4)
         self.nav_group = QButtonGroup(self)
         self.nav_btns = []
-        self.nav_names = ["Главная", "Буфер", "Загрузки", "Погода", "Таймер", "Заметка",
-                          "Полка", "Настройки"]
-        self.nav_icon_names = ["home", "clipboard", "download", "weather", "timer", "note",
-                               "shelf", "settings"]
+        self.navrow = navrow
+        self.nav_names = list(NAV_LABELS)
+        self.nav_icon_names = list(NAV_KEYS)
+        cfg_ui = load_config()
+        self.nav_order = clean_order(cfg_ui.get("nav_order"), NAV_KEYS[:7])
+        self.nav_hidden = [k for k in cfg_ui.get("nav_hidden", [])
+                           if k in NAV_KEYS[1:7]] if isinstance(cfg_ui.get("nav_hidden"), list) else []
+        self.fn_order = clean_order(cfg_ui.get("fn_order"), FN_ORDER)
+        self.fn_hidden = [k for k in cfg_ui.get("fn_hidden", []) if k in FN_ORDER] \
+            if isinstance(cfg_ui.get("fn_hidden"), list) else []
         self.btn_pin = QPushButton()
         self.btn_pin.setObjectName("nav")
         self.btn_pin.setCheckable(True)
@@ -2540,13 +3286,9 @@ class Island(QWidget):
         self.btn_pin.setCursor(Qt.PointingHandCursor)
         self.btn_pin.setFocusPolicy(Qt.NoFocus)
         self.btn_pin.toggled.connect(self.toggle_pin)
+        self.resident_tile = Resident(self.res, True)
+        self.residents.append(self.resident_tile)
         for i, tip in enumerate(self.nav_names):
-            if i == 7:
-                navrow.addStretch(1)
-                self.resident_tile = Resident(self.res, True)
-                self.residents.append(self.resident_tile)
-                navrow.addWidget(self.resident_tile)
-                navrow.addWidget(self.btn_pin)
             b = QPushButton()
             b.setObjectName("nav")
             b.setCheckable(True)
@@ -2556,11 +3298,11 @@ class Island(QWidget):
             b.setFocusPolicy(Qt.NoFocus)
             self.nav_group.addButton(b, i)
             self.nav_btns.append(b)
-            navrow.addWidget(b)
         self.btn_pin.setIconSize(QSize(18, 18))
         self.nav_group.idClicked.connect(self.set_page)
         self.nav_btns[0].setChecked(True)
         bl.addLayout(navrow)
+        self.layout_nav()
 
         self.stack = QStackedWidget()
         bl.addWidget(self.stack, 1)
@@ -2573,6 +3315,7 @@ class Island(QWidget):
         self.shelf = ShelfList()
         self.stack.addWidget(self.shelf)              # 6
         self.stack.addWidget(self.build_settings())   # 7
+        self.stack.addWidget(self.build_editor())     # 8 (редактор, без кнопки во вкладках)
 
         self.root.addWidget(self.body)
         self.body.hide()
@@ -2682,6 +3425,8 @@ class Island(QWidget):
                  ("pick", "Пипетка", self.act_pick), ("clean", "Чистый текст", self.act_clean),
                  ("record", "Запись экрана", self.act_rec), ("command", "Команда", self.act_cmd)]
         self.fn_icons = []
+        self.fn_btns = {}
+        self.fn_grid = grid
         for i, (icon_name, label, fn) in enumerate(funcs):
             b = QPushButton("  " + label)
             b.setObjectName("fn")
@@ -2690,12 +3435,13 @@ class Island(QWidget):
             b.setFocusPolicy(Qt.NoFocus)
             b.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             b.clicked.connect(fn)
-            grid.addWidget(b, i // 2, i % 2)
+            self.fn_btns[icon_name] = b
             self.fn_icons.append((b, icon_name))
             if icon_name == "record":
                 self.rec_btn = b
         mid.addLayout(grid, 9)
         pv.addLayout(mid, 1)
+        self.layout_fn()
 
         # ---- док с программами ----
         self.dock = self.card()
@@ -2708,16 +3454,91 @@ class Island(QWidget):
         return page
 
     def build_clipboard(self):
-        self.clip_list = QListWidget()
-        self.clip_list.setIconSize(QSize(72, 46))
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(8)
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        self.clip_search = QLineEdit()
+        self.clip_search.setPlaceholderText("Поиск по буферу…")
+        self.clip_search.setClearButtonEnabled(True)
+        self.clip_search.setFixedHeight(38)
+        self.clip_search.setStyleSheet(
+            "QLineEdit { border-radius: 19px; padding: 0 14px 0 6px; font-size: 14px; }")
+        self.clip_search_act = self.clip_search.addAction(
+            make_icon("search", "#8e8e93", size=18), QLineEdit.LeadingPosition)
+        self.clip_search.textChanged.connect(self.apply_clip_filter)
+        self.clip_search.returnPressed.connect(self.copy_first_clip)
+        btn_clear = QPushButton("Очистить")
+        btn_clear.setObjectName("seg")
+        btn_clear.setFixedHeight(38)
+        btn_clear.setCursor(Qt.PointingHandCursor)
+        btn_clear.setFocusPolicy(Qt.NoFocus)
+        btn_clear.setToolTip("Очистить историю буфера")
+        btn_clear.clicked.connect(self.clear_clips)
+        top.addWidget(self.clip_search, 1)
+        top.addWidget(btn_clear)
+        v.addLayout(top)
+        self.clip_list = ClipView()
         self.clip_list.itemClicked.connect(self.restore_clip)
+        self.clip_list.removeRequested.connect(self.remove_clip)
+        v.addWidget(self.clip_list, 1)
         QApplication.clipboard().dataChanged.connect(self.on_clipboard)
-        return self.clip_list
+        self.clip_tick = QTimer(self)   # обновляем «5 мин назад»
+        self.clip_tick.setInterval(30000)
+        self.clip_tick.timeout.connect(self.clip_list.viewport().update)
+        self.clip_tick.start()
+        self.apply_clip_filter()
+        return page
 
     def build_downloads(self):
-        self.dl_list = QListWidget()
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(8)
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        self.dl_search = QLineEdit()
+        self.dl_search.setPlaceholderText("Поиск по загрузкам…")
+        self.dl_search.setClearButtonEnabled(True)
+        self.dl_search.setFixedHeight(38)
+        self.dl_search.setStyleSheet(
+            "QLineEdit { border-radius: 19px; padding: 0 14px 0 6px; font-size: 14px; }")
+        self.dl_search_act = self.dl_search.addAction(
+            make_icon("search", "#8e8e93", size=18), QLineEdit.LeadingPosition)
+        self.dl_search.textChanged.connect(self.apply_dl_filter)
+        self.dl_search.returnPressed.connect(self.open_first_download)
+        btn_dir = QPushButton("Папка")
+        btn_dir.setObjectName("seg")
+        btn_dir.setFixedHeight(38)
+        btn_dir.setCursor(Qt.PointingHandCursor)
+        btn_dir.setFocusPolicy(Qt.NoFocus)
+        btn_dir.setToolTip("Открыть папку загрузок")
+        btn_dir.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(DL_DIR)))
+        top.addWidget(self.dl_search, 1)
+        top.addWidget(btn_dir)
+        v.addLayout(top)
+        self.dl_list = DlView()
         self.dl_list.itemDoubleClicked.connect(self.open_download)
-        return self.dl_list
+        self.dl_list.removeRequested.connect(self.remove_download)
+        self.dl_list.revealRequested.connect(self.reveal_download)
+        v.addWidget(self.dl_list, 1)
+        self.dl_tick = QTimer(self)   # время «5 мин» и бегущая полоска у активных загрузок
+        self.dl_tick.setInterval(60)
+        self.dl_tick.timeout.connect(self._dl_anim)
+        self.dl_tick.start()
+        self._dl_frames = 0
+        self._dl_key = None
+        self.refresh_dl_list()
+        return page
+
+    def _dl_anim(self):
+        self._dl_frames += 1
+        has_active = bool(self.dl_state)
+        if has_active or self._dl_frames % 500 == 0:   # время обновляем раз в ~30 секунд
+            if self.expanded or self._dl_frames % 500 == 0:
+                self.dl_list.viewport().update()
 
     def make_chip(self, icon_name):
         w = QWidget()
@@ -2927,7 +3748,7 @@ class Island(QWidget):
             h.addStretch(1)
             for w in widgets:
                 h.addWidget(w)
-            c.setFixedHeight(54)
+            c.setFixedHeight(44)
             v.addWidget(c)
 
         def seg(text, checkable=True):
@@ -2988,6 +3809,9 @@ class Island(QWidget):
         b_quit = seg("Выйти", checkable=False)
         b_quit.clicked.connect(QApplication.quit)
         row("Приложение", [self.btn_autostart, self.btn_update, b_quit])
+        b_edit = seg("Редактор интерфейса", checkable=False)
+        b_edit.clicked.connect(self.open_editor)
+        row("Расположение кнопок", [b_edit])
         for pop in (self.theme_pop, self.pet_pop):
             pop.opened.connect(self._popup_opened)
             pop.closed.connect(self._popup_closed)
@@ -2998,6 +3822,9 @@ class Island(QWidget):
         fx.setOpacity(0.45)   # полупрозрачная подпись внизу
         self.ver_label.setGraphicsEffect(fx)
         v.addWidget(self.ver_label)
+        self.upd_progress = UpdateProgress()
+        self.upd_progress.hide()
+        v.addWidget(self.upd_progress)
         return page
 
     # ---------- обновления ----------
@@ -3010,7 +3837,7 @@ class Island(QWidget):
         if info and info.get("status") == "new":
             if info.get("url"):
                 self.btn_update.setEnabled(False)
-                self.updater.install(info["url"])
+                self.updater.install(info["url"], info.get("size", 0))
             else:   # в релизе нет установщика: открываем страницу релиза
                 QDesktopServices.openUrl(QUrl(info.get("page") or RELEASES_PAGE))
             return
@@ -3034,19 +3861,145 @@ class Island(QWidget):
             self.btn_update.setText("Проверить обновления")
             self.set_update_status("не удалось проверить, нет связи")
 
+    def show_update_progress(self, frac, text):
+        """frac: 0..1, None = размер неизвестен; text = подпись под полоской."""
+        self.update_frac = frac if frac is not None else -1.0
+        self.ver_label.hide()
+        self.upd_progress.show()
+        self.upd_progress.set_state(frac, text)
+        self.update_pill()
+
+    def hide_update_progress(self):
+        self.update_frac = None
+        self.upd_progress.hide()
+        self.ver_label.show()
+        self.update_pill()
+
     def on_update_installing(self, info):
         st = info.get("status")
         if st == "downloading":
+            done, total = info.get("done", 0), info.get("total", 0)
             self.btn_update.setText("Скачиваю…")
-            self.set_update_status("скачиваю обновление…")
+            if total:
+                frac = min(1.0, done / total)
+                self.show_update_progress(
+                    frac, f"Скачиваю обновление · {int(frac * 100)}% "
+                          f"({fmt_size(done)} из {fmt_size(total)})")
+            else:
+                self.show_update_progress(None, f"Скачиваю обновление · {fmt_size(done)}")
         elif st == "started":
-            self.set_update_status("запускаю установщик…")
+            self.btn_update.setText("Устанавливаю…")
+            self.show_update_progress(1.0, "Скачано · запускаю установщик…")
             # закрываем остров сами, чтобы не висел старый экземпляр рядом с новым
-            QTimer.singleShot(600, QApplication.quit)
+            QTimer.singleShot(1200, QApplication.quit)
         else:
+            self.hide_update_progress()
             self.btn_update.setEnabled(True)
             self.btn_update.setText("Повторить")
             self.set_update_status("не удалось скачать обновление")
+
+    # ---------- расположение вкладок и кнопок ----------
+    def layout_nav(self):
+        while self.navrow.count():
+            self.navrow.takeAt(0)
+        hidden = set(self.nav_hidden)
+        for key in self.nav_order:
+            b = self.nav_btns[NAV_KEYS.index(key)]
+            self.navrow.addWidget(b)
+            b.setVisible(key not in hidden)
+        self.navrow.addStretch(1)
+        self.navrow.addWidget(self.resident_tile)
+        self.navrow.addWidget(self.btn_pin)
+        self.navrow.addWidget(self.nav_btns[7])
+
+    def layout_fn(self):
+        while self.fn_grid.count():
+            self.fn_grid.takeAt(0)
+        hidden = set(self.fn_hidden)
+        shown = [k for k in self.fn_order if k not in hidden]
+        for k in self.fn_order:
+            self.fn_btns[k].setVisible(k not in hidden)
+        for i, k in enumerate(shown):
+            self.fn_grid.addWidget(self.fn_btns[k], i // 2, i % 2)
+
+    @staticmethod
+    def make_seg(text):
+        b = QPushButton(text)
+        b.setObjectName("seg")
+        b.setCursor(Qt.PointingHandCursor)
+        b.setFocusPolicy(Qt.NoFocus)
+        return b
+
+    def build_editor(self):
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(8)
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        title = QLabel("Редактор интерфейса")
+        title.setStyleSheet("font-size: 17px; font-weight: 700;")
+        btn_reset = self.make_seg("Сбросить")
+        btn_reset.clicked.connect(self.editor_reset)
+        btn_done = self.make_seg("Готово")
+        btn_done.clicked.connect(lambda: self.set_page(7))
+        head.addWidget(title)
+        head.addStretch(1)
+        head.addWidget(btn_reset)
+        head.addWidget(btn_done)
+        v.addLayout(head)
+        v.addWidget(self.sub_label("Перетащи плитку, чтобы поменять порядок. "
+                                   "Нажми на неё, чтобы скрыть или показать.", 12))
+        v.addSpacing(2)
+        v.addWidget(self.sub_label("Вкладки сверху", 12))
+        self.tab_board = DragBoard(4, (150, 38))
+        self.tab_board.changed.connect(self.editor_changed)
+        v.addWidget(self.tab_board, 0, Qt.AlignLeft)
+        v.addSpacing(2)
+        v.addWidget(self.sub_label("Кнопки на главной", 12))
+        self.fn_board = DragBoard(4, (150, 38))
+        self.fn_board.changed.connect(self.editor_changed)
+        v.addWidget(self.fn_board, 0, Qt.AlignLeft)
+        v.addStretch(1)
+        self.fill_editor()
+        return page
+
+    def fill_editor(self):
+        hid = set(self.nav_hidden)
+        self.tab_board.set_items([(k, NAV_LABELS[NAV_KEYS.index(k)], k, k == "home", k not in hid)
+                                  for k in self.nav_order])
+        fh = set(self.fn_hidden)
+        self.fn_board.set_items([(k, FN_LABELS[k], k, False, k not in fh)
+                                 for k in self.fn_order])
+
+    def editor_changed(self):
+        self.nav_order = self.tab_board.order()
+        self.nav_hidden = [k for k in self.tab_board.hidden() if k != "home"]
+        self.fn_order = self.fn_board.order()
+        self.fn_hidden = self.fn_board.hidden()
+        set_cfg(nav_order=self.nav_order, nav_hidden=self.nav_hidden,
+                fn_order=self.fn_order, fn_hidden=self.fn_hidden)
+        self.layout_nav()
+        self.layout_fn()
+        self.refresh_nav()
+
+    def editor_reset(self):
+        self.nav_order, self.nav_hidden = list(NAV_KEYS[:7]), []
+        self.fn_order, self.fn_hidden = list(FN_ORDER), []
+        set_cfg(nav_order=self.nav_order, nav_hidden=[], fn_order=self.fn_order, fn_hidden=[])
+        self.fill_editor()
+        self.layout_nav()
+        self.layout_fn()
+        self.refresh_nav()
+
+    def open_editor(self):
+        self.fill_editor()
+        self.nav_group.setExclusive(False)
+        for b in self.nav_btns:
+            b.setChecked(False)
+        self.nav_group.setExclusive(True)
+        self.stack.setCurrentIndex(EDITOR_PAGE)
+        self.refresh_nav()
 
     def open_popup(self, popup, btn):
         if time.time() - popup.closed_at < 0.25:  # клик, закрывший список, не должен открыть его снова
@@ -3088,6 +4041,13 @@ class Island(QWidget):
         bg.setAlpha(max(bg.alpha(), 246))
         for pop in (self.theme_pop, self.pet_pop):
             pop.set_colors(bg, QColor(*T["border"]))
+        self.clip_list.set_colors(T)
+        self.tab_board.set_colors(T)
+        self.fn_board.set_colors(T)
+        self.upd_progress.set_colors(T)
+        self.dl_list.set_colors(T)
+        self.dl_search_act.setIcon(make_icon("search", T["sub"], size=18))
+        self.clip_search_act.setIcon(make_icon("search", T["sub"], size=18))
         self.theme_btn.set_name(T["name"])
         self.theme_btn.preview.set_key(self.theme)
         self.theme_pop.set_current(self.theme)
@@ -3166,7 +4126,7 @@ class Island(QWidget):
         self.player_card.tint = a
         # эквалайзер: стиль и цвета берём из темы, а цвет обложки трека перекрывает их
         for eq, key, default in ((self.card_eq, "eq_card", fg),
-                                 (self.mini_eq, "eq_pill", QColor("#ffffff"))):
+                                 (self.toast_eq, "eq_pill", QColor("#ffffff"))):
             c1, c2 = T.get(key, (None, None))
             eq.style = T.get("eq", "bars")
             eq.color = QColor(a) if a else (QColor(c1) if c1 else default)
@@ -3196,6 +4156,7 @@ class Island(QWidget):
         self.peek_hover = False
         if self.expanded:
             return
+        self.cancel_toast()
         self.expanded = True
         self.root.setContentsMargins(*MARGIN_EXPANDED)
         self.pill_box.hide()
@@ -3213,7 +4174,9 @@ class Island(QWidget):
 
     def collapse(self):
         if (not self.expanded or self.pinned or self.busy
-                or self.note.hasFocus() or self.city_edit.hasFocus()):
+                or self.note.hasFocus() or self.city_edit.hasFocus()
+                or self.clip_search.hasFocus() or self.dl_search.hasFocus()
+                or self.stack.currentIndex() == EDITOR_PAGE):
             return
         if QApplication.mouseButtons() != Qt.NoButton:
             self.collapse_timer.start()
@@ -3363,6 +4326,7 @@ class Island(QWidget):
         if (self.autohide and not self.hidden_state and not self._hiding
                 and not self.expanded and not self.pinned and not self.busy
                 and not self.peek_hover and not self.desktop_keep()
+                and not self.toast_active
                 and not self.underMouse() and not self.recorder.active
                 and time.time() > self.flash_until + 0.7
                 and time.time() - self.pill_since > 1.5):
@@ -3516,6 +4480,9 @@ class Island(QWidget):
         music = idle = False
         if time.time() < self.flash_until:
             text = self.flash_text
+        elif self.update_frac is not None:
+            text = ("↓ Обновление…" if self.update_frac < 0
+                    else f"↓ Обновление {int(self.update_frac * 100)}%")
         elif self.recorder.active:
             m, s = divmod(int(time.time() - self.rec_start), 60)
             text = f"● REC {m:02d}:{s:02d}"
@@ -3525,7 +4492,7 @@ class Island(QWidget):
         elif self.downloads_active:
             text = f"↓ {fmt_size(self.dl_speed)}/с"
         elif self.music_playing and self.title:
-            text = self.title + (f" — {self.artist}" if self.artist else "")
+            text = QTime.currentTime().toString("HH:mm")   # название не пишем: обложка и время
             music = True
         else:
             text = QTime.currentTime().toString("HH:mm")
@@ -3538,12 +4505,23 @@ class Island(QWidget):
         if show_w:
             self.pill_wicon.set_kind(self.weather_kind)
         self.mini_art.setVisible(music)
-        self.mini_eq.setVisible(music)
-        self.mini_eq.set_active(music)
-        width = 290 if music else 190
+        width = MUSIC_PILL_W if music else 200
+        # надпись занимает ровно столько места, сколько ей нужно: тогда значок погоды
+        # стоит вплотную к градусам, а вся группа по центру пилюли
+        fnt = QFont(self.font())
+        fnt.setPixelSize(13)
+        fnt.setWeight(QFont.DemiBold)
+        art_w = 0 if self.mini_art.isHidden() else self.mini_art.width()
+        pet_w = 0 if self.resident_pill.isHidden() else self.resident_pill.width()
+        ico_w = 0 if self.pill_wicon.isHidden() else self.pill_wicon.width() + 5
+        items = 3 + (art_w > 0) + (pet_w > 0)      # растяжка, надпись, растяжка + обложка, питомец
+        avail = width - 28 - art_w - pet_w - ico_w - 8 * (items - 1)
+        self.pill.setFixedWidth(int(max(20, min(
+            QFontMetrics(fnt).horizontalAdvance(text) + 10, avail))))
         if width != self.collapsed_w:
             self.collapsed_w = width
-            if not self.expanded and not self.hidden_state and not self._hiding:
+            if (not self.expanded and not self.hidden_state and not self._hiding
+                    and not self.toast_active):
                 self.animate_to(self.rect_for(width, COLLAPSED_H),
                                 QEasingCurve(QEasingCurve.OutCubic), 300)
 
@@ -3554,6 +4532,12 @@ class Island(QWidget):
 
     def on_media(self, title, artist, playing, available, pos, dur, source):
         self.title, self.artist, self.music_playing = title, artist, playing
+        key = (title, artist) if (available and title) else None
+        if key is None:
+            self.track_key = None
+        elif key != self.track_key and playing:
+            self.track_key = key
+            self.queue_toast()
         self.pos, self.dur, self.pos_stamp = pos, dur, time.monotonic()
         if not available:
             self.music_title.setText("Музыка недоступна")
@@ -3576,6 +4560,9 @@ class Island(QWidget):
                 pix = pm
         self.art.set_pixmap(pix)
         self.mini_art.set_pixmap(pix)
+        self.toast_art.set_pixmap(pix)
+        if self._toast_wait:       # ждали обложку нового трека
+            self.start_toast()
         self.accent = None
         if pix:
             c = pix.toImage().scaled(1, 1, Qt.IgnoreAspectRatio,
@@ -3587,6 +4574,87 @@ class Island(QWidget):
                 self.accent = a
         self.update_accent()
         self.update()
+
+    # ---------- показ нового трека в компактном режиме ----------
+    def queue_toast(self):
+        self._toast_wait = True
+        QTimer.singleShot(650, self.start_toast)   # даём время подгрузиться обложке
+
+    def start_toast(self):
+        if not self._toast_wait:
+            return
+        self._toast_wait = False
+        if self.expanded or not self.title:
+            return                                  # шторка открыта: плеер и так виден
+        self.toast_title.setText(self.title)
+        self.toast_artist.setText(self.artist)
+        self.toast_artist.setVisible(bool(self.artist))
+        f1, f2 = QFont(self.font()), QFont(self.font())
+        f1.setPixelSize(15)
+        f1.setBold(True)
+        f2.setPixelSize(12)
+        need = max(QFontMetrics(f1).horizontalAdvance(self.title),
+                   QFontMetrics(f2).horizontalAdvance(self.artist or ""))
+        scr_w = QApplication.primaryScreen().geometry().width()
+        self.toast_w = int(max(300, min(need + 14 + 56 + 12 + 14 + 18 + 18, 480, scr_w - 40)))
+        self._toast_gen += 1
+        self.toast_eq.set_active(self.music_playing)
+        if self.hidden_state or self._hiding:
+            self.reveal(False)                      # остров был спрятан: показываем его
+        curve = QEasingCurve(QEasingCurve.OutBack)
+        curve.setOvershoot(0.6)
+        if not self.toast_active:
+            self.toast_active = True
+            self.pill_box.hide()
+            self.root.setContentsMargins(*TOAST_MARGINS)
+            self.toast_box.show()
+            self.toast_fade.stop()
+            self.toast_fade.setStartValue(self.toast_fx.opacity())
+            self.toast_fade.setEndValue(1.0)
+            self.toast_fade.setDuration(380)
+            self.toast_fade.setEasingCurve(QEasingCurve(QEasingCurve.InOutCubic))
+            self.toast_fade.start()
+            self.animate_to(self.rect_for(self.toast_w, TOAST_H), curve, 440)
+        else:                                        # трек сменился, пока показ ещё идёт
+            self.toast_fade.stop()
+            self.toast_fx.setOpacity(1.0)
+            self.animate_to(self.rect_for(self.toast_w, TOAST_H), curve, 300)
+        self.toast_timer.start(int(TOAST_SECS * 1000))
+
+    def end_toast(self):
+        """Гасим содержимое и плавно возвращаем компактный размер."""
+        if not self.toast_active:
+            return
+        gen = self._toast_gen
+        self.toast_fade.stop()
+        self.toast_fade.setStartValue(self.toast_fx.opacity())
+        self.toast_fade.setEndValue(0.0)
+        self.toast_fade.setDuration(170)
+        self.toast_fade.setEasingCurve(QEasingCurve(QEasingCurve.InCubic))
+        self.toast_fade.start()
+        QTimer.singleShot(180, lambda: self._finish_toast(gen))
+
+    def _finish_toast(self, gen):
+        if gen != self._toast_gen or not self.toast_active or self.expanded:
+            return                                  # за это время показ обновили или отменили
+        self.toast_active = False
+        self.toast_box.hide()
+        self.pill_box.show()
+        self.root.setContentsMargins(*MARGIN_COLLAPSED)
+        self.pill_since = time.time()
+        self.update_pill()
+        self.animate_to(self.rect_for(self.collapsed_w, COLLAPSED_H),
+                        QEasingCurve(QEasingCurve.OutCubic), 360)
+
+    def cancel_toast(self):
+        """Мгновенно убирает показ трека (например, когда шторка раскрывается)."""
+        self._toast_wait = False
+        self._toast_gen += 1
+        self.toast_timer.stop()
+        self.toast_fade.stop()
+        self.toast_fx.setOpacity(0.0)
+        self.toast_active = False
+        self.toast_box.hide()
 
     def on_seek(self, frac):
         if self.dur > 0:
@@ -3639,7 +4707,14 @@ class Island(QWidget):
         for path in self.dock_paths:
             b = QPushButton()
             b.setObjectName("dockbtn")
-            b.setIcon(self.icons.icon(QFileInfo(path)))
+            try:
+                icon = self.icons.icon(QFileInfo(path))
+            except Exception as ex:
+                log(f"dock icon: {ex}", once=True)
+                icon = QIcon()
+            if icon.isNull():
+                icon = self.style().standardIcon(QStyle.SP_FileIcon)
+            b.setIcon(icon)
             b.setIconSize(QSize(28, 28))
             b.setFixedSize(44, 44)
             b.setCursor(Qt.PointingHandCursor)
@@ -3670,14 +4745,36 @@ class Island(QWidget):
             self.flash("⚠ Не удалось запустить", 4)
 
     def dock_add(self):
+        # Диалог Qt без системного окна Windows: родное окно выбора файла падало
+        # из-за конфликта COM-режимов (winrt/pycaw). Родителя нет, чтобы стили острова
+        # не перекрашивали диалог.
+        path = ""
         self.busy += 1
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Добавить программу", "", "Программы (*.exe *.lnk);;Все файлы (*)")
-        self.busy -= 1
+        try:
+            dlg = QFileDialog(None, "Добавить программу")
+            dlg.setOption(QFileDialog.DontUseNativeDialog, True)
+            dlg.setFileMode(QFileDialog.ExistingFile)
+            dlg.setNameFilter("Программы (*.exe *.lnk);;Все файлы (*)")
+            dlg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+            if dlg.exec() and dlg.selectedFiles():
+                path = dlg.selectedFiles()[0]
+        except Exception as ex:
+            log(f"dock_add dialog: {ex}", once=True)
+        finally:
+            self.busy = max(0, self.busy - 1)
+        path = os.path.normpath(path) if path else ""
         if path and path not in self.dock_paths:
             self.dock_paths.append(path)
             set_cfg(dock=self.dock_paths)
-            self.rebuild_dock()
+            try:
+                self.rebuild_dock()
+            except Exception as ex:   # не роняем остров из-за одного значка
+                log(f"rebuild_dock: {ex}", once=True)
+                self.dock_paths.remove(path)
+                set_cfg(dock=self.dock_paths)
+                self.rebuild_dock()
+                self.flash("⚠ Не удалось добавить", 4)
+        self.collapse_timer.start()
 
     def dock_menu(self, path, btn, pos):
         menu = QMenu(self)
@@ -3960,32 +5057,121 @@ class Island(QWidget):
             self.dl_state.pop(path)
             if recent:
                 recent.sort(reverse=True)
-                _, name, full = recent[0]
-                self.dl_done.insert(0, (name, full))
-                self.dl_done = self.dl_done[:30]
+                mt, name, full = recent[0]
+                try:
+                    size = os.path.getsize(full)
+                except OSError:
+                    size = 0
+                self.dl_done = [d for d in self.dl_done if d["path"] != full]
+                self.dl_done.insert(0, {"name": name, "path": full, "size": size, "t": mt})
+                self.dl_done = self.dl_done[:60]
                 self.flash("✓ " + name)
         self.dl_speed = sum(s["speed"] for s in self.dl_state.values())
         self.downloads_active = any(s["speed"] > 1 for s in self.dl_state.values())
         self.refresh_dl_list()
 
     def refresh_dl_list(self):
+        key = (tuple(self.dl_state), tuple((d["path"], d["t"]) for d in self.dl_done))
+        if key == self._dl_key:
+            # состав списка не изменился: обновляем только размер и скорость у активных
+            for i in range(self.dl_list.count()):
+                it = self.dl_list.item(i)
+                if it.data(KIND_ROLE) == "active":
+                    path = next((q for q in self.dl_state
+                                 if it.data(TITLE_ROLE) == self._dl_name(q)), None)
+                    if path:
+                        st = self.dl_state[path]
+                        it.setData(SUB_ROLE, f"{fmt_size(st['size'])} · {fmt_size(st['speed'])}/с")
+            self.dl_list.viewport().update()
+            return
+        self._dl_key = key
+        bar = self.dl_list.verticalScrollBar()
+        pos = bar.value()
         self.dl_list.clear()
         for path, st in self.dl_state.items():
-            name = os.path.basename(path)
-            for ext in PARTIAL_EXT:
-                if name.lower().endswith(ext):
-                    name = name[:-len(ext)]
-            self.dl_list.addItem(
-                f"↓ {name}\n    {fmt_size(st['size'])} · {fmt_size(st['speed'])}/с")
-        for name, full in self.dl_done:
-            it = QListWidgetItem("✓ " + name)
-            it.setData(Qt.UserRole, full)
+            name = self._dl_name(path)
+            it = QListWidgetItem()
+            it.setData(KIND_ROLE, "active")
+            it.setData(TITLE_ROLE, name)
+            it.setData(SUB_ROLE, f"{fmt_size(st['size'])} · {fmt_size(st['speed'])}/с")
+            it.setData(FIND_ROLE, (name + " загружается идёт").lower())
+            it.setData(TIME_ROLE, time.time())
             self.dl_list.addItem(it)
+        for d in self.dl_done:
+            color, label, ext = dl_kind(d["name"])
+            it = QListWidgetItem()
+            it.setData(Qt.UserRole, d["path"])
+            it.setData(KIND_ROLE, "done")
+            it.setData(THUMB_ROLE, color)       # цвет значка
+            it.setData(TITLE_ROLE, d["name"])
+            it.setData(SUB_ROLE, f"{fmt_size(d['size'])} · {label}")
+            # первая строка FIND_ROLE: подпись на значке, дальше то, по чему ищем
+            it.setData(FIND_ROLE, f"{ext}\n{d['name']} {label} {ext}".lower())
+            it.setData(TIME_ROLE, d["t"])
+            self.dl_list.addItem(it)
+        self.apply_dl_filter()
+        bar.setValue(pos)
+
+    @staticmethod
+    def _dl_name(path):
+        name = os.path.basename(path)
+        for ext in PARTIAL_EXT:
+            if name.lower().endswith(ext):
+                name = name[:-len(ext)]
+        return name
+
+    def apply_dl_filter(self, *_):
+        q = self.dl_search.text().strip().lower()
+        shown = 0
+        for i in range(self.dl_list.count()):
+            it = self.dl_list.item(i)
+            hay = (it.data(FIND_ROLE) or "").split("\n")[-1]
+            ok = not q or q in hay
+            it.setHidden(not ok)
+            shown += ok
+        if shown:
+            self.dl_list.hint = ""
+        elif self.dl_list.count():
+            self.dl_list.hint = "Ничего не найдено"
+        else:
+            self.dl_list.hint = "Загрузок пока нет\nСкачанные файлы появятся здесь"
+        self.dl_list.viewport().update()
+
+    def _dl_path(self, item):
+        path = item.data(Qt.UserRole) if item is not None else None
+        if path and not os.path.exists(path):
+            self.flash("⚠ Файл не найден", 4)
+            self.remove_download(item)
+            return None
+        return path
 
     def open_download(self, item):
-        path = item.data(Qt.UserRole)
+        path = self._dl_path(item)
         if path:
             QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def open_first_download(self):
+        for i in range(self.dl_list.count()):
+            if not self.dl_list.item(i).isHidden():
+                self.open_download(self.dl_list.item(i))
+                return
+
+    def reveal_download(self, item):
+        path = self._dl_path(item)
+        if not path:
+            return
+        try:
+            if sys.platform == "win32":
+                subprocess.Popen(f'explorer /select,"{os.path.normpath(path)}"')
+            else:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(path)))
+        except Exception as ex:
+            log(f"reveal: {ex}", once=True)
+
+    def remove_download(self, item):
+        path = item.data(Qt.UserRole)
+        self.dl_done = [d for d in self.dl_done if d["path"] != path]
+        self.refresh_dl_list()
 
     # ---------- буфер обмена ----------
     def on_clipboard(self):
@@ -3993,15 +5179,18 @@ class Island(QWidget):
             return
         cb = QApplication.clipboard()
         text = cb.text()
+        it = QListWidgetItem()
         if text.strip():
             for i in range(self.clip_list.count()):
                 if self.clip_list.item(i).data(Qt.UserRole) == text:
                     self.drop_clip_row(i)
                     break
-            short = " ".join(text.split())
-            it = QListWidgetItem(short[:80] + ("…" if len(short) > 80 else ""))
+            kind, title, sub = classify_clip(text)
             it.setData(Qt.UserRole, text)
-            self.clip_list.insertItem(0, it)
+            it.setData(KIND_ROLE, kind)
+            it.setData(TITLE_ROLE, title)
+            it.setData(SUB_ROLE, sub)
+            it.setData(FIND_ROLE, (text + " " + CLIP_KINDS[kind][2]).lower())
         elif cb.mimeData().hasImage():
             img = cb.image()
             if img.isNull():
@@ -4012,24 +5201,63 @@ class Island(QWidget):
                 return
             self.img_seq += 1
             self.clip_images[self.img_seq] = img
-            thumb = QPixmap.fromImage(img).scaled(72, 46, Qt.KeepAspectRatio,
+            thumb = QPixmap.fromImage(img).scaled(152, 136, Qt.KeepAspectRatioByExpanding,
                                                   Qt.SmoothTransformation)
-            it = QListWidgetItem(QIcon(thumb), f"  Изображение {img.width()}×{img.height()}")
+            thumb = thumb.copy((thumb.width() - 152) // 2, (thumb.height() - 136) // 2, 152, 136)
+            size = f"{img.width()}×{img.height()}"
             it.setData(IMG_ROLE, self.img_seq)
-            self.clip_list.insertItem(0, it)
-            imgs = [i for i in range(self.clip_list.count())
-                    if self.clip_list.item(i).data(IMG_ROLE)]
-            for i in reversed(imgs[10:]):  # храним не больше 10 картинок
-                self.drop_clip_row(i)
+            it.setData(KIND_ROLE, "image")
+            it.setData(THUMB_ROLE, thumb)
+            it.setData(TITLE_ROLE, "Изображение")
+            it.setData(SUB_ROLE, size)
+            it.setData(FIND_ROLE, f"изображение картинка фото image {size}")
         else:
             return
+        it.setData(TIME_ROLE, time.time())
+        self.clip_list.insertItem(0, it)
+        imgs = [i for i in range(self.clip_list.count())
+                if self.clip_list.item(i).data(IMG_ROLE)]
+        for i in reversed(imgs[10:]):  # храним не больше 10 картинок
+            self.drop_clip_row(i)
         while self.clip_list.count() > 50:
             self.drop_clip_row(self.clip_list.count() - 1)
+        self.apply_clip_filter()
 
     def drop_clip_row(self, row):
         it = self.clip_list.takeItem(row)
         if it is not None and it.data(IMG_ROLE):
             self.clip_images.pop(it.data(IMG_ROLE), None)
+
+    def apply_clip_filter(self, *_):
+        q = self.clip_search.text().strip().lower()
+        shown = 0
+        for i in range(self.clip_list.count()):
+            it = self.clip_list.item(i)
+            ok = not q or q in (it.data(FIND_ROLE) or "")
+            it.setHidden(not ok)
+            shown += ok
+        if shown:
+            self.clip_list.hint = ""
+        elif self.clip_list.count():
+            self.clip_list.hint = "Ничего не найдено"
+        else:
+            self.clip_list.hint = "Буфер пуст\nСкопируй что-нибудь, и оно появится здесь"
+        self.clip_list.viewport().update()
+
+    def remove_clip(self, item):
+        self.drop_clip_row(self.clip_list.row(item))
+        self.apply_clip_filter()
+
+    def clear_clips(self):
+        while self.clip_list.count():
+            self.drop_clip_row(0)
+        self.apply_clip_filter()
+
+    def copy_first_clip(self):
+        for i in range(self.clip_list.count()):
+            if not self.clip_list.item(i).isHidden():
+                self.restore_clip(self.clip_list.item(i))
+                return
 
     def restore_clip(self, item):
         self._own_clip = True
@@ -4038,6 +5266,9 @@ class Island(QWidget):
             QApplication.clipboard().setImage(self.clip_images[iid])
         elif item.data(Qt.UserRole):
             QApplication.clipboard().setText(item.data(Qt.UserRole))
+        item.setData(COPIED_ROLE, time.time())
+        self.clip_list.viewport().update()
+        QTimer.singleShot(1500, self.clip_list.viewport().update)
         QTimer.singleShot(300, lambda: setattr(self, "_own_clip", False))
 
     # ---------- таймер ----------
@@ -4088,8 +5319,28 @@ class Island(QWidget):
             pass
 
 
+def install_crash_log():
+    """Пишет в ~/.island_log.txt Python-ошибки и аварийный дамп при падении Qt/DLL."""
+    import traceback
+
+    def hook(t, v, tb):
+        log("UNCAUGHT " + "".join(traceback.format_exception(t, v, tb)))
+
+    sys.excepthook = hook
+    threading.excepthook = lambda a: hook(a.exc_type, a.exc_value, a.exc_traceback)
+    try:
+        import faulthandler
+        global _fault_file
+        _fault_file = open(LOG_FILE, "a", buffering=1, encoding="utf-8")
+        faulthandler.enable(_fault_file)
+    except Exception:
+        pass
+
+
 def main():
+    install_crash_log()
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)   # закрытие диалога не должно завершать остров
     # один экземпляр: после обновления старый может ещё закрываться, поэтому ждём до 8 с
     app.lock = QLockFile(os.path.join(tempfile.gettempdir(), "MiniIsland.lock"))
     if not app.lock.tryLock(8000):
